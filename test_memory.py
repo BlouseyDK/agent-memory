@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import textwrap
 from datetime import datetime
 
 import pytest
@@ -217,10 +218,29 @@ def mem():
 
     yield system
 
+    # Clean up resources before deleting the file (Windows requirement)
+    system.close()
     os.unlink(db_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+
+def wrapped_print(text, width=100):
+    """
+    Prints text wrapped to the given width.
+    
+    :param text: The string to print.
+    :param width: Maximum characters per line.
+    """
+    if not isinstance(text, str):
+        text = str(text)  # Convert non-string input to string
+    
+    # Wrap the text into a list of lines
+    wrapped_lines = textwrap.wrap(text, width=width)
+    
+    # Print each wrapped line
+    for line in wrapped_lines:
+        print(line)
 
 def test_activities_loaded(mem):
     """All sample activities were stored."""
@@ -342,6 +362,8 @@ if __name__ == "__main__":
         result = system.log_activity(datetime.fromisoformat(ts), activity)
         n = len(result["memories"])
         print(f"\n📝 {ts[:10]}  ({n} memories)")
+        print (f"Activity")
+        wrapped_print(activity)
         for m in result["memories"]:
             print(f"   [{m.get('memory_type','?'):10s}] ({m.get('topic','?')}) {m.get('content','')}")
 
@@ -379,4 +401,7 @@ if __name__ == "__main__":
 
     print(f"\n{'='*60}")
     print("  Done.")
+    
+    # Clean up resources before deleting the file (Windows requirement)
+    system.close()
     os.unlink(db_path)

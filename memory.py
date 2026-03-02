@@ -457,3 +457,18 @@ class MemorySystem:
             "topics":            n_topics,
             "by_type":           by_type,
         }
+
+    def close(self) -> None:
+        """Clean up resources and close connections."""
+        # Clear the cached embedder to free up resources
+        if self._embedder is not None:
+            del self._embedder
+            self._embedder = None
+        
+        # Ensure all SQLite connections are closed by opening and closing one more time
+        # This forces SQLite to release any remaining file handles
+        try:
+            with sqlite3.connect(self.db_path) as con:
+                con.execute("PRAGMA optimize")
+        except Exception:
+            pass  # Ignore errors during cleanup
