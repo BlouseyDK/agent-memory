@@ -75,6 +75,9 @@ def main() -> None:
         print(f"   Topics:             {s['topics']}")
         for mtype, count in s["by_type"].items():
             print(f"     {mtype}: {count}")
+        print(f"   Markdown files:     {s['md_files']}  ({s['md_total_bytes']:,} bytes)")
+        index_status = "built" if s["vector_index_built"] else "not yet built"
+        print(f"   Vector index:       {index_status} ({s['embeddings_stored']} embeddings)")
 
     # ── demo ──────────────────────────────────────────────────────────────────
     elif cmd == "demo":

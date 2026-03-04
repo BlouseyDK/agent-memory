@@ -9,7 +9,14 @@ Memory taxonomy (Google / OpenClaw):
   - semantic:    facts, preferences, knowledge ("what I know")
   - procedural:  workflows, routines, patterns ("how to do something")
 
-Storage:  SQLite + FTS5 (keyword) + cosine similarity (vector)
+Storage (two-tier, OpenClaw-style):
+  Tier 1 — .md files: human-readable notes written for every memory, one file
+            per topic, stored in md_dir/.  Always written regardless of size.
+  Tier 2 — SQLite + FTS5 + vector embeddings: the vector index is built
+            automatically once the total .md size exceeds MD_SIZE_THRESHOLD.
+            FTS5 (BM25) is always available; vector search activates only after
+            the index is initialised, mirroring OpenClaw's behaviour.
+
 LLM:      Anthropic Claude (extraction, consolidation, summarization)
 Embeddings: sentence-transformers/all-MiniLM-L6-v2 (local, no API key)
 
@@ -23,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime
 from typing import Optional
@@ -36,13 +44,15 @@ load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-DEFAULT_DB      = os.environ.get("MEMORY_DB",         "memory.db")
-DEFAULT_MODEL   = os.environ.get("ANTHROPIC_MODEL",   "claude-sonnet-4-5-20250929")
-EMBED_MODEL     = os.environ.get("EMBEDDING_MODEL",   "all-MiniLM-L6-v2")
+DEFAULT_DB        = os.environ.get("MEMORY_DB",          "memory.db")
+DEFAULT_MODEL     = os.environ.get("ANTHROPIC_MODEL",    "claude-sonnet-4-5-20250929")
+EMBED_MODEL       = os.environ.get("EMBEDDING_MODEL",    "all-MiniLM-L6-v2")
+MD_DIR            = os.environ.get("MEMORY_MD_DIR",      "memory_notes")
+MD_SIZE_THRESHOLD = int(os.environ.get("MD_SIZE_THRESHOLD", str(32 * 1024)))  # 32 KB
 
 # Hybrid search weights (must sum to 1.0)
-WEIGHT_BM25     = 0.40
-WEIGHT_VECTOR   = 0.60
+WEIGHT_BM25   = 0.40
+WEIGHT_VECTOR = 0.60
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 
@@ -98,6 +108,12 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
     memory_id   INTEGER PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
     embedding   BLOB    NOT NULL
 );
+
+-- Metadata for tracking .md-to-vector-index state
+CREATE TABLE IF NOT EXISTS md_meta (
+    key     TEXT PRIMARY KEY,
+    value   TEXT NOT NULL
+);
 """
 
 
@@ -105,13 +121,18 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
 
 class MemorySystem:
     """
-    Simple agent memory system with hybrid search.
+    Agent memory system with two-tier storage (OpenClaw-style).
+
+    Tier 1: human-readable .md files, one per topic, always written.
+    Tier 2: SQLite FTS5 + vector embeddings, built automatically once the
+            total .md size exceeds MD_SIZE_THRESHOLD bytes.
 
     Parameters
     ----------
     db_path : path to SQLite database file (created if missing)
     api_key : Anthropic API key (defaults to ANTHROPIC_API_KEY env var)
     model   : Anthropic model ID
+    md_dir  : directory for .md memory files (created if missing)
     """
 
     def __init__(
@@ -119,11 +140,14 @@ class MemorySystem:
         db_path: str = DEFAULT_DB,
         api_key: str | None = None,
         model: str = DEFAULT_MODEL,
+        md_dir: str = MD_DIR,
     ) -> None:
         self.db_path = db_path
         self.model   = model
+        self.md_dir  = md_dir
         self.client  = Anthropic(api_key=api_key or os.environ["ANTHROPIC_API_KEY"])
         self._embedder: SentenceTransformer | None = None
+        os.makedirs(md_dir, exist_ok=True)
         self._setup_db()
 
     # ── Setup ─────────────────────────────────────────────────────────────────
@@ -159,6 +183,121 @@ class MemorySystem:
     @staticmethod
     def _cosine(a: np.ndarray, b: np.ndarray) -> float:
         return float(np.dot(a, b))
+
+    # ── Markdown file helpers ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _sanitize_topic(topic: str) -> str:
+        """Convert a topic label to a safe filename component."""
+        return re.sub(r"[^\w\-]", "_", topic.lower().strip()) or "general"
+
+    def _md_path(self, topic: str) -> str:
+        return os.path.join(self.md_dir, f"{self._sanitize_topic(topic)}.md")
+
+    def _write_to_md(
+        self,
+        memory_id:   int,
+        content:     str,
+        topic:       str,
+        memory_type: str,
+        activity_id: int,
+        created_at:  str,
+    ) -> None:
+        """Append a new memory entry to the topic's .md file."""
+        path  = self._md_path(topic)
+        entry = (
+            f"<!-- id:{memory_id} type:{memory_type} "
+            f"activity:{activity_id} created:{created_at} -->\n"
+            f"{content}\n"
+        )
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(f"# {topic}\n\n{entry}")
+        else:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(f"\n{entry}")
+
+    def _update_md_entry(self, memory_id: int, new_content: str) -> None:
+        """Update the content line of an existing .md entry by memory_id."""
+        with sqlite3.connect(self.db_path) as con:
+            row = con.execute(
+                "SELECT topic FROM memories WHERE id=?", (memory_id,)
+            ).fetchone()
+        if not row:
+            return
+
+        path = self._md_path(row[0])
+        if not os.path.exists(path):
+            return
+
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+
+        pattern = re.compile(rf"^<!-- id:{memory_id}\b")
+        for i, line in enumerate(lines):
+            if pattern.match(line):
+                # Replace the first non-empty line after the comment
+                for j in range(i + 1, len(lines)):
+                    if lines[j].strip():
+                        lines[j] = new_content + "\n"
+                        break
+                break
+
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.writelines(lines)
+
+    def _md_total_size(self) -> int:
+        """Return combined byte size of all .md files in md_dir."""
+        if not os.path.isdir(self.md_dir):
+            return 0
+        total = 0
+        for fname in os.listdir(self.md_dir):
+            if fname.endswith(".md"):
+                try:
+                    total += os.path.getsize(os.path.join(self.md_dir, fname))
+                except OSError:
+                    pass
+        return total
+
+    def _should_embed(self) -> bool:
+        """True once .md files have grown past the size threshold."""
+        return self._md_total_size() >= MD_SIZE_THRESHOLD
+
+    def _has_embeddings(self) -> bool:
+        """True if the vector index has been initialised."""
+        with sqlite3.connect(self.db_path) as con:
+            return bool(
+                con.execute(
+                    "SELECT value FROM md_meta WHERE key='embeddings_initialized'"
+                ).fetchone()
+            )
+
+    def _ensure_all_embeddings(self) -> None:
+        """
+        One-time initialisation: build embeddings for every memory that does
+        not have one yet, then record that the index is ready.
+        Subsequent calls are no-ops once the flag is set.
+        """
+        if self._has_embeddings():
+            return
+
+        with sqlite3.connect(self.db_path) as con:
+            missing = con.execute(
+                "SELECT m.id, m.content FROM memories m "
+                "LEFT JOIN memory_embeddings e ON e.memory_id = m.id "
+                "WHERE e.memory_id IS NULL"
+            ).fetchall()
+
+        if missing:
+            print(f"Building vector index for {len(missing)} existing memories…")
+            for mem_id, content in missing:
+                self._store_embedding(mem_id, content)
+
+        with sqlite3.connect(self.db_path) as con:
+            con.execute(
+                "INSERT OR REPLACE INTO md_meta (key, value) "
+                "VALUES ('embeddings_initialized', '1')"
+            )
 
     # =========================================================================
     # PUBLIC API
@@ -310,6 +449,10 @@ class MemorySystem:
         """
         Check if a similar memory already exists.
         If so, update it (consolidation). Otherwise create a new entry.
+
+        Always writes to the topic's .md file.  The vector embedding is only
+        stored once .md files exceed MD_SIZE_THRESHOLD (Tier 2 activation).
+
         Returns the memory ID.
         """
         content     = mem.get("content", "")
@@ -338,21 +481,30 @@ class MemorySystem:
                             "UPDATE memories SET content=?, updated_at=datetime('now') WHERE id=?",
                             (content, mem_id),
                         )
-                    self._store_embedding(mem_id, content)
+                    self._update_md_entry(mem_id, content)
+                    if self._should_embed():
+                        self._ensure_all_embeddings()
+                        self._store_embedding(mem_id, content)
                     return mem_id
             except (json.JSONDecodeError, ValueError, KeyError):
                 pass
 
         # Create new memory
+        created_at = datetime.utcnow().isoformat(timespec="seconds")
         with sqlite3.connect(self.db_path) as con:
             cur = con.execute(
-                "INSERT INTO memories (content, topic, memory_type, source_activity_id) "
-                "VALUES (?, ?, ?, ?)",
-                (content, topic, memory_type, activity_id),
+                "INSERT INTO memories (content, topic, memory_type, source_activity_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (content, topic, memory_type, activity_id, created_at),
             )
             mem_id = cur.lastrowid
 
-        self._store_embedding(mem_id, content)
+        self._write_to_md(mem_id, content, topic, memory_type, activity_id, created_at)
+
+        if self._should_embed():
+            self._ensure_all_embeddings()
+            self._store_embedding(mem_id, content)
+
         return mem_id
 
     def _store_embedding(self, memory_id: int, text: str) -> None:
@@ -415,18 +567,24 @@ class MemorySystem:
     def _hybrid_search(self, query: str, limit: int = 10) -> list[dict]:
         """
         Combine BM25 + vector search with weighted scoring.
-        Mirrors OpenClaw's mergeHybridResults approach.
+
+        While .md files are below MD_SIZE_THRESHOLD (Tier 1), only BM25 is
+        used — no embedding model is loaded.  Once the vector index is
+        initialised (Tier 2), both signals are merged, mirroring OpenClaw's
+        mergeHybridResults approach.
         """
         bm25 = self._fts_search(query, limit=limit * 2)
-        vec  = self._vector_search(query, limit=limit * 2)
+
+        # Vector search is only available after the index is initialised
+        vec = self._vector_search(query, limit=limit * 2) if self._has_embeddings() else []
 
         # Normalise BM25 scores to [0, 1]
         bm25_max  = max((r["score"] for r in bm25), default=1.0) or 1.0
         bm25_norm = {r["id"]: r["score"] / bm25_max for r in bm25}
         vec_norm  = {r["id"]: r["score"] for r in vec}  # already [0,1]
 
-        all_ids   = set(bm25_norm) | set(vec_norm)
-        lookup    = {r["id"]: r for r in bm25 + vec}
+        all_ids = set(bm25_norm) | set(vec_norm)
+        lookup  = {r["id"]: r for r in bm25 + vec}
 
         merged = []
         for mid in all_ids:
@@ -451,11 +609,28 @@ class MemorySystem:
                     "SELECT memory_type, COUNT(*) FROM memories GROUP BY memory_type"
                 ).fetchall()
             )
+            n_embeddings = con.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0]
+
+        n_md_files     = 0
+        md_total_bytes = 0
+        if os.path.isdir(self.md_dir):
+            for fname in os.listdir(self.md_dir):
+                if fname.endswith(".md"):
+                    n_md_files += 1
+                    try:
+                        md_total_bytes += os.path.getsize(os.path.join(self.md_dir, fname))
+                    except OSError:
+                        pass
+
         return {
-            "activities_logged": n_activities,
-            "memories_stored":   n_memories,
-            "topics":            n_topics,
-            "by_type":           by_type,
+            "activities_logged":  n_activities,
+            "memories_stored":    n_memories,
+            "topics":             n_topics,
+            "by_type":            by_type,
+            "md_files":           n_md_files,
+            "md_total_bytes":     md_total_bytes,
+            "vector_index_built": self._has_embeddings(),
+            "embeddings_stored":  n_embeddings,
         }
 
     def close(self) -> None:
@@ -464,7 +639,7 @@ class MemorySystem:
         if self._embedder is not None:
             del self._embedder
             self._embedder = None
-        
+
         # Ensure all SQLite connections are closed by opening and closing one more time
         # This forces SQLite to release any remaining file handles
         try:

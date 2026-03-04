@@ -14,6 +14,7 @@ Or with pytest (skips if ANTHROPIC_API_KEY not set):
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import textwrap
 from datetime import datetime
@@ -199,8 +200,9 @@ def mem():
 
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         db_path = f.name
+    md_dir = tempfile.mkdtemp(suffix="_memory_notes")
 
-    system = MemorySystem(db_path=db_path)
+    system = MemorySystem(db_path=db_path, md_dir=md_dir)
     print(f"\n\n{'='*60}")
     print("LOADING SAMPLE ACTIVITIES")
     print(f"{'='*60}")
@@ -221,6 +223,7 @@ def mem():
     # Clean up resources before deleting the file (Windows requirement)
     system.close()
     os.unlink(db_path)
+    shutil.rmtree(md_dir, ignore_errors=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -346,12 +349,11 @@ if __name__ == "__main__":
         print("❌  ANTHROPIC_API_KEY not set. Copy .env.example to .env and add your key.")
         raise SystemExit(1)
 
-    import tempfile
-
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         db_path = f.name
+    md_dir = tempfile.mkdtemp(suffix="_memory_notes")
 
-    system = MemorySystem(db_path=db_path)
+    system = MemorySystem(db_path=db_path, md_dir=md_dir)
 
     # ── Load activities ───────────────────────────────────────────────────────
     print(f"\n{'='*60}")
@@ -401,7 +403,8 @@ if __name__ == "__main__":
 
     print(f"\n{'='*60}")
     print("  Done.")
-    
+
     # Clean up resources before deleting the file (Windows requirement)
     system.close()
     os.unlink(db_path)
+    shutil.rmtree(md_dir, ignore_errors=True)
