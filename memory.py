@@ -10,8 +10,9 @@ Memory taxonomy (Google / OpenClaw):
   - procedural:  workflows, routines, patterns ("how to do something")
 
 Storage (two-tier, OpenClaw-style):
-  Tier 1 — .md files: human-readable notes written for every memory, one file
-            per topic, stored in md_dir/.  Always written regardless of size.
+  Tier 1 — .md files (always written, human-readable):
+              MEMORY.md          — durable semantic + procedural memories
+              YYYY-MM-DD.md      — daily append-only episodic log
   Tier 2 — SQLite + FTS5 + vector embeddings: the vector index is built
             automatically once the total .md size exceeds MD_SIZE_THRESHOLD.
             FTS5 (BM25) is always available; vector search activates only after
@@ -123,7 +124,9 @@ class MemorySystem:
     """
     Agent memory system with two-tier storage (OpenClaw-style).
 
-    Tier 1: human-readable .md files, one per topic, always written.
+    Tier 1: human-readable .md files, always written:
+              MEMORY.md       — semantic + procedural (durable knowledge)
+              YYYY-MM-DD.md   — episodic (daily append-only log)
     Tier 2: SQLite FTS5 + vector embeddings, built automatically once the
             total .md size exceeds MD_SIZE_THRESHOLD bytes.
 
@@ -186,25 +189,47 @@ class MemorySystem:
 
     # ── Markdown file helpers ─────────────────────────────────────────────────
 
-    @staticmethod
-    def _sanitize_topic(topic: str) -> str:
-        """Convert a topic label to a safe filename component."""
-        return re.sub(r"[^\w\-]", "_", topic.lower().strip()) or "general"
+    def _memory_md_path(self) -> str:
+        """Path to MEMORY.md — the durable semantic + procedural store."""
+        return os.path.join(self.md_dir, "MEMORY.md")
 
-    def _md_path(self, topic: str) -> str:
-        return os.path.join(self.md_dir, f"{self._sanitize_topic(topic)}.md")
+    def _episodic_md_path(self, date_str: str) -> str:
+        """Path to the daily episodic file, e.g. memory_notes/2026-03-04.md."""
+        return os.path.join(self.md_dir, f"{date_str}.md")
+
+    def _md_file_for_memory(self, memory_id: int) -> str | None:
+        """Return the .md file path that contains the given memory_id."""
+        with sqlite3.connect(self.db_path) as con:
+            row = con.execute(
+                "SELECT memory_type, created_at FROM memories WHERE id=?", (memory_id,)
+            ).fetchone()
+        if not row:
+            return None
+        memory_type, created_at = row
+        if memory_type == "episodic":
+            return self._episodic_md_path(created_at[:10])
+        return self._memory_md_path()
 
     def _write_to_md(
         self,
         memory_id:   int,
         content:     str,
-        topic:       str,
         memory_type: str,
         activity_id: int,
         created_at:  str,
     ) -> None:
-        """Append a new memory entry to the topic's .md file."""
-        path  = self._md_path(topic)
+        """
+        Append a new memory entry to the correct .md file:
+          - episodic   → YYYY-MM-DD.md  (daily append-only log)
+          - semantic / procedural → MEMORY.md  (durable knowledge store)
+        """
+        if memory_type == "episodic":
+            path   = self._episodic_md_path(created_at[:10])
+            header = f"# {created_at[:10]}\n\n"
+        else:
+            path   = self._memory_md_path()
+            header = "# Memory\n\n"
+
         entry = (
             f"<!-- id:{memory_id} type:{memory_type} "
             f"activity:{activity_id} created:{created_at} -->\n"
@@ -212,22 +237,15 @@ class MemorySystem:
         )
         if not os.path.exists(path):
             with open(path, "w", encoding="utf-8") as fh:
-                fh.write(f"# {topic}\n\n{entry}")
+                fh.write(header + entry)
         else:
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(f"\n{entry}")
 
     def _update_md_entry(self, memory_id: int, new_content: str) -> None:
         """Update the content line of an existing .md entry by memory_id."""
-        with sqlite3.connect(self.db_path) as con:
-            row = con.execute(
-                "SELECT topic FROM memories WHERE id=?", (memory_id,)
-            ).fetchone()
-        if not row:
-            return
-
-        path = self._md_path(row[0])
-        if not os.path.exists(path):
+        path = self._md_file_for_memory(memory_id)
+        if not path or not os.path.exists(path):
             return
 
         with open(path, "r", encoding="utf-8") as fh:
@@ -450,7 +468,8 @@ class MemorySystem:
         Check if a similar memory already exists.
         If so, update it (consolidation). Otherwise create a new entry.
 
-        Always writes to the topic's .md file.  The vector embedding is only
+        Always writes to the appropriate .md file (MEMORY.md for semantic/
+        procedural, YYYY-MM-DD.md for episodic).  The vector embedding is only
         stored once .md files exceed MD_SIZE_THRESHOLD (Tier 2 activation).
 
         Returns the memory ID.
@@ -499,7 +518,7 @@ class MemorySystem:
             )
             mem_id = cur.lastrowid
 
-        self._write_to_md(mem_id, content, topic, memory_type, activity_id, created_at)
+        self._write_to_md(mem_id, content, memory_type, activity_id, created_at)
 
         if self._should_embed():
             self._ensure_all_embeddings()
