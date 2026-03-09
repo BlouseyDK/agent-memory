@@ -299,6 +299,12 @@ class MemorySystem:
         if self._has_embeddings():
             return
 
+        md_size_kb = self._md_total_size() / 1024
+        print(
+            f"[MemorySystem] MD size threshold reached ({md_size_kb:.1f} KB >= "
+            f"{MD_SIZE_THRESHOLD / 1024:.1f} KB) — compacting memories into SQLite vector index (Tier 2)…"
+        )
+
         with sqlite3.connect(self.db_path) as con:
             missing = con.execute(
                 "SELECT m.id, m.content FROM memories m "
@@ -316,6 +322,7 @@ class MemorySystem:
                 "INSERT OR REPLACE INTO md_meta (key, value) "
                 "VALUES ('embeddings_initialized', '1')"
             )
+        print("[MemorySystem] Compaction complete — SQLite vector index is now active.")
 
     # =========================================================================
     # PUBLIC API
@@ -659,10 +666,11 @@ class MemorySystem:
             del self._embedder
             self._embedder = None
 
-        # Ensure all SQLite connections are closed by opening and closing one more time
-        # This forces SQLite to release any remaining file handles
+        # Checkpoint and close the WAL so Windows releases all file handles
         try:
-            with sqlite3.connect(self.db_path) as con:
-                con.execute("PRAGMA optimize")
+            con = sqlite3.connect(self.db_path)
+            con.execute("PRAGMA optimize")
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            con.close()
         except Exception:
             pass  # Ignore errors during cleanup

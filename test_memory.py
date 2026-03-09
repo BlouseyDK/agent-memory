@@ -384,8 +384,8 @@ if __name__ == "__main__":
         print(f"\n📖  Summary — '{topic}':\n")
         print(system.summarize_memory(topic))
 
-    print(f"\n📖  Summary — all topics:\n")
-    print(system.summarize_memory())
+    # print(f"\n📖  Summary — all topics:\n")
+    # print(system.summarize_memory())
 
     # ── Context retrieval ─────────────────────────────────────────────────────
     print(f"\n\n{'='*60}")
